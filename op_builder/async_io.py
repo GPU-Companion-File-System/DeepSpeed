@@ -69,7 +69,18 @@ class AsyncIOBuilder(TorchCPUOpBuilder):
             ldflags = ['-laio']  # the ROCM case
         else:
             CUDA_LIB64 = os.path.join(CUDA_HOME, "lib64")
-            ldflags = [f'-L{CUDA_HOME}', f'-L{CUDA_LIB64}', '-laio', '-lcuda', '-lcudart']
+            # 添加系统库路径，libcuda.so 通常在这里
+            system_lib_paths = [
+                '/lib/x86_64-linux-gnu',
+                '/usr/lib/x86_64-linux-gnu',
+                '/usr/lib64',
+            ]
+            ldflags = [f'-L{CUDA_HOME}', f'-L{CUDA_LIB64}']
+            # 添加系统库路径（如果存在）
+            for path in system_lib_paths:
+                if os.path.exists(path):
+                    ldflags.append(f'-L{path}')
+            ldflags.extend(['-laio', '-lcuda', '-lcudart'])
         return ldflags
 
     def check_for_libaio_pkg(self):
