@@ -36,6 +36,8 @@ deepspeed.egg-info/
 # Build information
 build.txt
 
+.cache/*
+
 ## Website generated files
 # Jekyll generated site
 docs/_site/
