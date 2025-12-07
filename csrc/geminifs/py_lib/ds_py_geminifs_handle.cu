@@ -87,22 +87,32 @@ bool deepspeed_geminifs_handle_t::unpin_device_tensor(const torch::Tensor& buffe
 }
 
 // read / write implementations
-int deepspeed_geminifs_handle_t::read(torch::Tensor& buffer,
+bool deepspeed_geminifs_handle_t::read(torch::Tensor& buffer,
                                       const GPUFileId gpu_file_id,
                                       const bool validate, 
                                       const int64_t file_offset,
                                       const int64_t stream_id) {
     if (!geminifs_initialized_) {
         std::cerr << "GeminiFS controller is not initialized." << std::endl;
-        exit(EXIT_FAILURE);
+        return false;
     }
     const auto device_id = buffer.get_device();
+    if (device_id < 0) {
+        std::cerr << "Buffer must be a GPU tensor for GeminiFS read." << std::endl;
+        return false;
+    }
+
     const auto stream = reinterpret_cast<cudaStream_t>(stream_id);
     const auto gpu_controller = geminifs_instance_->geminifs_get_gpu_controller(device_id);
+    if (gpu_controller == nullptr) {
+        std::cerr << "Failed to get GPU controller for device " << device_id << std::endl;
+        return false;
+    }
+    
     return geminifs_instance_->geminifs_GPU_read_kernel(buffer, gpu_file_id, file_offset, gpu_controller, stream);
 }
 
-int deepspeed_geminifs_handle_t::write(const torch::Tensor& buffer,
+bool deepspeed_geminifs_handle_t::write(const torch::Tensor& buffer,
                                        const GPUFileId gpu_file_id,
                                        const bool validate, 
                                        const int64_t file_offset, 
@@ -112,8 +122,18 @@ int deepspeed_geminifs_handle_t::write(const torch::Tensor& buffer,
         exit(EXIT_FAILURE);
     }
     const auto device_id = buffer.get_device();
+    if (device_id < 0) {
+        std::cerr << "Buffer must be a GPU tensor for GeminiFS write." << std::endl;
+        return false;
+    }
+
     const auto stream = reinterpret_cast<cudaStream_t>(stream_id);
     const auto gpu_controller = geminifs_instance_->geminifs_get_gpu_controller(device_id);
+    if (gpu_controller == nullptr) {
+        std::cerr << "Failed to get GPU controller for device " << device_id << std::endl;
+        return false;
+    }
+    
     return geminifs_instance_->geminifs_GPU_write_kernel(buffer, gpu_file_id, file_offset, gpu_controller, stream);
 }
 

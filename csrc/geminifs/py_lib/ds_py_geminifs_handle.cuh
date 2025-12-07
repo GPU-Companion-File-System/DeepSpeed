@@ -16,13 +16,13 @@ struct deepspeed_geminifs_handle_t {
     int get_block_size();
     int get_alignment();
 
-    int read(torch::Tensor& buffer,
+    bool read(torch::Tensor& buffer,
              const GPUFileId gpu_file_id,
              const bool validate,
              const int64_t file_offset, 
              const int64_t stream_id);
 
-    int write(const torch::Tensor& buffer,
+    bool write(const torch::Tensor& buffer,
               const GPUFileId gpu_file_id,
               const bool validate,
               const int64_t file_offset,
