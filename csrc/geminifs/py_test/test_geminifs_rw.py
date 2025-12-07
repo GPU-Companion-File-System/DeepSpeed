@@ -20,7 +20,7 @@ if __name__ == "__main__":
     # -----------------------
     block_size = 64 * 1024
     nr_files = 1024
-    config_path = "/home/yjq/LoRA-DeepSpeed/Geminifs/sys_config.ini"
+    config_path = "/home/zfw/LoRA-DeepSpeed/Geminifs/sys_config.ini"
 
     handle = GeminiFSBuilder().load().geminifs_handle(config_path, block_size, nr_files)
     print("Geminifs initialization test passed.")

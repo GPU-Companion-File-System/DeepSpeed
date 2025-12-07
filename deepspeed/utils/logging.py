@@ -58,7 +58,7 @@ class LoggerFactory:
         return logger_
 
 
-logger = LoggerFactory.create_logger(name="DeepSpeed", level=logging.WARNING)
+logger = LoggerFactory.create_logger(name="DeepSpeed", level=logging.INFO)
 
 
 @functools.lru_cache(None)

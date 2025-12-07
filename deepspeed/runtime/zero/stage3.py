@@ -47,7 +47,7 @@ OPTIMIZER_SWAP_OUT_STATE_TIMER = 'optimizer_swap_out_state'
 OPTIMIZER_STEP_TIMER = 'optimizer_step'
 
 
-def print_rank_0(message, debug=False, force=False):
+def print_rank_0(message, debug=True, force=False):
     rank = dist.get_rank()
     if rank == 0 and (debug or force):
         logger.info(message)
@@ -827,6 +827,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # if necessary, create a pinned memory buffer to be used for swapping out
         # params to NVME after optimizer step
+        for flattened_partition_group in self.fp16_partitioned_groups_flat:
+            logger.error(f"flattened_partition_group is {flattened_partition_group}")
         should_create_fp16_flat_reuse_buffer = any(flattened_partition_group is None
                                                    for flattened_partition_group in self.fp16_partitioned_groups_flat)
         if should_create_fp16_flat_reuse_buffer:

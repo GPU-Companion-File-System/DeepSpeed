@@ -14,14 +14,38 @@ from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import AsyncIOBuilder
 from deepspeed.ops.op_builder import GDSBuilder
+from deepspeed.ops.op_builder import GeminiFSBuilder
 from .constants import *
 from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool
 
+from deepspeed.utils.logging import logger
 
 def print_rank_0(message, debug=False, force=False):
     if dist.get_rank() == 0 and (debug or force):
         print(message)
 
+
+def geminifs_swap_in_tensors(swapper, tensor_buffers, swap_paths):
+    print(f"GeminiFS: swap in tensors, buffer size: {tensor_buffers[0].size()}, path: {swap_paths[0]}, len of self.streams {len(swapper.geminifs_streams)}")
+    print(f"buffer is located in {tensor_buffers[0].device}")
+    # import traceback
+    # print("Call trace for geminifs_swap_in_tensors:")
+    # traceback.print_stack()
+    for buffer, path in zip(tensor_buffers, swap_paths):
+        stream = torch.cuda.Stream()
+        swapper.geminifs_streams.append(stream)
+        assert (swapper.aio_read_handle.read(buffer, path, False, 0, stream.cuda_stream) == 1)
+
+
+def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
+    print(f"GeminiFS: swap out tensors, buffer size: {tensor_buffers[0].size()}, path: {swap_paths[0]}")
+    # import traceback
+    # print("Call trace for geminifs_swap_in_tensors:")
+    # traceback.print_stack()
+    for buffer, path in zip(tensor_buffers, swap_paths):
+        stream = torch.cuda.Stream()
+        swapper.geminifs_streams.append(stream)
+        assert (swapper.aio_write_handle.write(buffer, path, False, 0, stream.cuda_stream) == 1)
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
@@ -74,7 +98,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.invalid_buffer = torch.tensor(1).half()
 
         if dist.get_rank() == 0:
-            exclude_list = ['aio_read_handle', 'aio_write_handle', 'buffers']
+            exclude_list = ['aio_read_handle', 'aio_write_handle', 'buffers', 'geminifs_streams', 'geminifs_id_to_fd']
             print_object(obj=self, name='AsyncPartitionedParameterSwapper', exclude_list=exclude_list)
 
     def available_swap_in_buffers(self):
@@ -93,12 +117,27 @@ class AsyncPartitionedParameterSwapper(object):
         self.aio_config = ds_config.aio_config
 
         self.use_gds = self.aio_config[AIO_USE_GDS]
-        self.aio_handle = GDSBuilder().load(verbose=False).gds_handle if self.use_gds else AsyncIOBuilder().load(
-            verbose=False).aio_handle
+
+        # for debug
+        self.use_geminifs = True
+
+        if self.use_geminifs:
+            logger.info("Using GeminiFS for class AsyncPartitionedParameterSwapper")
+            self.aio_handle = GeminiFSBuilder().load(verbose=False).geminifs_handle
+            self.geminifs_streams = []
+            self.geminifs_id_to_fd = {}
+        elif self.use_gds:
+            self.aio_handle = GDSBuilder().load(verbose=False).gds_handle
+        else:
+            self.aio_handle =  AsyncIOBuilder().load(verbose=False).aio_handle
 
         # Read/Write alignment for each thread during Intra-request parallelism
         self.min_aio_bytes = max(MIN_AIO_BYTES, self.aio_config[AIO_BLOCK_SIZE])
-        self.aligned_bytes = AIO_ALIGNED_BYTES * self.aio_config[AIO_INTRA_OP_PARALLELISM]
+        if self.use_geminifs:
+            # TODO: bad practice
+            self.aligned_bytes = self.aio_config[AIO_BLOCK_SIZE]
+        else:
+            self.aligned_bytes = AIO_ALIGNED_BYTES * self.aio_config[AIO_INTRA_OP_PARALLELISM]
         self.numel_alignment = self.aligned_bytes // self.swap_element_size
 
         self.elements_per_buffer = self.swap_config.buffer_size
@@ -108,27 +147,38 @@ class AsyncPartitionedParameterSwapper(object):
         self.available_buffer_ids = [i for i in range(self.param_buffer_count)]
         self.reserved_buffer_ids = []
 
-        self.aio_read_handle = self.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
-                                               queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
-                                               single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
-                                               overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
-                                               intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
+        if self.use_geminifs:
+            logger.info(f"GeminiFS: config_path: , block_size: {self.aio_config[AIO_BLOCK_SIZE]}, nr_files: ")
+            self.aio_read_handle = self.aio_handle(config_path="/home/zfw/LoRA-DeepSpeed/Geminifs/sys_config.ini",
+                                                    block_size=self.aio_config[AIO_BLOCK_SIZE],
+                                                    nr_files=2048)
 
-        self.aio_write_handle = self.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
+            self.aio_write_handle = self.aio_read_handle
+            logger.info(f"GeminiFS: aio_read_handle initialized")
+        else:
+            self.aio_read_handle = self.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
                                                 queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
                                                 single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
                                                 overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
                                                 intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
 
-        buffer_device = get_accelerator().device_name() if self.use_gds else "cpu"
+            self.aio_write_handle = self.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
+                                                    queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
+                                                    single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
+                                                    overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
+                                                    intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
+
+        buffer_device = get_accelerator().device_name() if (self.use_gds or self.use_geminifs) else "cpu"
         self.buffers = torch.empty(int(self.aligned_elements_per_buffer * self.param_buffer_count),
                                    dtype=self.dtype,
                                    device=buffer_device,
                                    requires_grad=False)
-        if self.use_gds:
+
+        if self.use_gds or self.use_geminifs:
             self.aio_read_handle.pin_device_tensor(self.buffers)
         else:
             self.buffers = get_accelerator().pin_memory(self.buffers, align_bytes=0)
+        logger.info(f"Pinned buffers initialized, from {hex(self.buffers.data_ptr())} to {hex(self.buffers.data_ptr() + self.buffers.nbytes)}")
 
         self.swap_out_params = []
 
@@ -142,8 +192,30 @@ class AsyncPartitionedParameterSwapper(object):
         assert False, "Either param or numel must be provided"
 
     def get_path(self, param, must_exist=False):
-        paths = self._get_swap_paths([param], must_exist=must_exist)
+        if self.use_geminifs:
+            paths = self._get_geminifs_swap_paths([param], must_exist=must_exist)
+        else:
+            paths = self._get_swap_paths([param], must_exist=must_exist)
         return paths[0]
+
+    def _get_geminifs_swap_paths(self, params, must_exist=False):
+        # TODO For multipile GPU, device index need to be checked
+        paths = []
+        for param in params:
+            param_id = param.ds_id
+            device_id = param.ds_tensor.device.index
+
+            # check if cached
+            if param_id in self.geminifs_id_to_fd.keys():
+                cached_device_id, gpu_file_id = self.geminifs_id_to_fd[param_id]
+                # assert cached_device_id == device_id, f"Cached device id {cached_device_id} does not match device id {device_id} for param {param_id}"
+            else:
+                assert not must_exist, f"Path for param id {param_id} does not exist"
+                ok, gpu_file_id = self.aio_read_handle.get_geminifs_gpu_file(device_id)
+                self.geminifs_id_to_fd[param_id] = (device_id, gpu_file_id)
+            paths.append(gpu_file_id)
+        # logger.info(f"GeminiFS: swap id, path pair: ({param_id}, {gpu_file_id})")
+        return paths
 
     def _get_swap_paths(self, params, must_exist=False):
         paths = []
@@ -204,7 +276,13 @@ class AsyncPartitionedParameterSwapper(object):
     def synchronize_writes(self):
         if self.pending_writes == 0:
             return
-        assert self.pending_writes == self.aio_write_handle.wait()
+        if self.use_geminifs:
+            for stream in self.geminifs_streams:
+                stream.synchronize()
+            self.geminifs_streams.clear()
+        else:
+            assert self.pending_writes == self.aio_write_handle.wait()
+
         self.pending_writes = 0
         self.remove_partition_and_release_buffers(self.swap_out_params)
         self.swap_out_params = []
@@ -214,7 +292,12 @@ class AsyncPartitionedParameterSwapper(object):
         if self.pending_reads == 0:
             return
 
-        assert self.pending_reads == self.aio_read_handle.wait()
+        if self.use_geminifs:
+            for stream in self.geminifs_streams:
+                stream.synchronize()
+            self.geminifs_streams.clear()
+        else:
+            assert self.pending_reads == self.aio_read_handle.wait()
 
         self.pending_reads = 0
 
@@ -258,11 +341,18 @@ class AsyncPartitionedParameterSwapper(object):
     #writes from in memory to nvme. Does not release the buffers
     def _swap_out(self, params, async_op=True):
 
-        swap_out_paths = self._get_swap_paths(params)
+        if self.use_geminifs:
+            swap_out_paths = self._get_geminifs_swap_paths(params)
+        else:
+            swap_out_paths = self._get_swap_paths(params)
+
         swap_out_params = self._get_swap_buffers(params)
         self._track_numel(params)
 
-        swap_out_tensors(self.aio_write_handle, swap_out_params, swap_out_paths)
+        if self.use_geminifs:
+            geminifs_swap_out_tensors(self, swap_out_params, swap_out_paths)
+        else:
+            swap_out_tensors(self.aio_write_handle, swap_out_params, swap_out_paths)
 
         self.pending_writes += len(swap_out_params)
         self.swap_out_params += params
@@ -292,7 +382,10 @@ class AsyncPartitionedParameterSwapper(object):
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
-        swap_in_paths = self._get_swap_paths(params)
+        if self.use_geminifs:
+            swap_in_paths = self._get_geminifs_swap_paths(params)
+        else:
+            swap_in_paths = self._get_swap_paths(params)
 
         if swap_in_buffers is None:
             if len(self.available_buffer_ids) < len(swap_in_paths):
@@ -315,7 +408,10 @@ class AsyncPartitionedParameterSwapper(object):
         else:
             inflight_numel = sum([t.numel() for t in swap_in_buffers])
 
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        if self.use_geminifs:
+            geminifs_swap_in_tensors(self, swap_in_buffers, swap_in_paths)
+        else:
+            swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
 
         self._update_inflight_swap_in(params, swap_in_buffers, inflight_numel)
 
@@ -337,9 +433,16 @@ class AsyncPartitionedParameterSwapper(object):
             swap_in_buffers = [dest_buffer]
             inflight_numel = dest_buffer.numel()
 
-        swap_in_paths = self._get_swap_paths([param])
+        if self.use_geminifs:
+            swap_in_paths = self._get_geminifs_swap_paths([param])
+        else:
+            swap_in_paths = self._get_swap_paths([param])
 
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        if self.use_geminifs:
+            geminifs_swap_in_tensors(self, swap_in_buffers, swap_in_paths)
+        else:
+            swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+
         self._update_inflight_swap_in([param], swap_in_buffers, inflight_numel)
         self.synchronize_reads()
 
@@ -391,6 +494,7 @@ class AsyncPartitionedParameterSwapper(object):
         return (numel % self.numel_alignment) == 0
 
     def reserve_partitioned_swap_space(self, partition_num_elems):
+        logger.error("!!!!!!!!!!!!!! This is not edited !!!!!!!!!!!!!!!!!!!!!!!")
         aligned_numel = sum([self._io_aligned_numel(numel) for numel in partition_num_elems])
         self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.zeros(aligned_numel,
                                                                                 device='cpu',
@@ -399,12 +503,17 @@ class AsyncPartitionedParameterSwapper(object):
         self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer])
 
     def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):
+        logger.error("!!!!!!!!!!!!!! This is not edited !!!!!!!!!!!!!!!!!!!!!!!")
         assert self.partitioned_swap_buffer is not None, 'partitioned swap buffers for fp16 params not initialized'
         assert self.partitioned_swap_pool is not None, 'partitioned swap pool for fp16 params not initialized'
         assert len(dst_fp16_params) == len(src_fp32_params), \
         f'mismatch in number of fp16 params {len(dst_fp16_params)} and fp32 params {len(src_fp32_params)}'
 
-        fp16_swap_paths = self._get_swap_paths(dst_fp16_params, must_exist=True)
+        if self.use_geminifs:
+            fp16_swap_paths = self._get_geminifs_swap_paths(dst_fp16_params, must_exist=True)
+        else:
+            fp16_swap_paths = self._get_swap_paths(dst_fp16_params, must_exist=True)
+
         self.synchronize_writes()
         self.partitioned_swap_pool.reset()
         for i, fp32_tensor in enumerate(src_fp32_params):
