@@ -65,7 +65,17 @@ class GeminiFSBuilder(CUDAOpBuilder):
 
     def extra_ldflags(self):
         geminifs_lib_path = os.path.join(self.geminifs_path, "build", "lib")
-        return super().extra_ldflags() + ['-lgeminifs', f'-L{geminifs_lib_path}']
+        flags = super().extra_ldflags() + ['-lgeminifs', f'-L{geminifs_lib_path}']
+        # Add rpath so the library can be found at runtime
+        if self.jit_load:
+            flags.append(f'-Wl,-rpath,{geminifs_lib_path}')
+            # Add rpath for libgeminifs.so's PyTorch dependencies
+            # libgeminifs.so was compiled against third_pkgs/libtorch
+            third_pkgs_libtorch_path = os.path.join(self.geminifs_path, "third_pkgs", "libtorch", "lib")
+            if os.path.exists(third_pkgs_libtorch_path):
+                flags.append(f'-Wl,-rpath,{third_pkgs_libtorch_path}')
+        return flags
+        
 
     def is_compatible(self, verbose=False):
         try:
