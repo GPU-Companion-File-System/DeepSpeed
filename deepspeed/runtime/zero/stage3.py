@@ -756,8 +756,35 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _create_fp16_partitions_with_defragmentation(self, fp16_param_groups):
         dist.barrier()
 
+        # Print summary of fp16_param_groups (before transformation)
+        fp16_summary = []
+        fp16_params_counts = []
+        for i, param_group in enumerate(fp16_param_groups):
+            group_info = {k: v for k, v in param_group.items() if k != 'params'}
+            params_count = len(param_group.get('params', []))
+            group_info['params_count'] = params_count
+            fp16_params_counts.append(params_count)
+            fp16_summary.append(f"Group {i}: {group_info}")
+        print_rank_0(f"fp16_param_groups (len={len(fp16_param_groups)}): {fp16_summary}", force=True)
+        
         param_groups: List[List[Parameter]] = tuple(
             self._create_fp16_sub_groups(param_group["params"]) for param_group in fp16_param_groups)
+        
+        # Print summary of param_groups (after transformation) - showing the splitting
+        param_summary = []
+        for i, sub_groups in enumerate(param_groups):
+            sub_group_info = []
+            total_params_after = 0
+            for j, sub_group in enumerate(sub_groups):
+                sub_group_params_count = len(sub_group)
+                total_params_after += sub_group_params_count
+                sub_group_info.append(f"sub_group_{j}({sub_group_params_count} params)")
+            
+            # Show transformation: original params count -> sub_groups count and total params
+            original_count = fp16_params_counts[i] if i < len(fp16_params_counts) else 0
+            transformation_info = f"Group {i}: {original_count} params -> {len(sub_groups)} sub_groups ({total_params_after} total params)"
+            param_summary.append(f"{transformation_info} [{', '.join(sub_group_info)}]")
+        print_rank_0(f"param_groups (len={len(param_groups)}): {param_summary}", force=True)
 
         # bookkeeping related to param groups
         for param_group_idx, param_group in enumerate(param_groups):

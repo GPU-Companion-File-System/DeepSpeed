@@ -1578,6 +1578,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         swap_in_list = []
         swap_in_flight = []
         for param in params:
+            # logger.error(f"param {param.ds_id} status is {param.ds_tensor.status} final_location is {param.ds_tensor.final_location} ds_status is {param.ds_status}")
+            if param.ds_tensor.status == PartitionedParamStatus.AVAILABLE:
+                logger.warning(f"param {param.ds_id} status is AVAILABLE tensor is located in {param.ds_tensor.device}, tensor size: {param.ds_tensor.nbytes}")
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
                 swap_in_list.append(param)
@@ -1699,6 +1702,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     else:
                         device = self.remote_device
 
+                    # bad practice
+                    # if param.nvme_swapper != None and param.nvme_swapper.use_geminifs:
+                    # if param.nvme_swapper != None:
+                    #     logger.warning(f"param {param.ds_id} is using GeminiFS for swapper, tensor must located in gpu")
+                    #     device = self.local_device
+
                     partitioned_tensor = torch.empty(partition_size, dtype=param.dtype, device=device)
                     # quantize the tensor if it's not trainable
                     if not param.requires_grad and self.quantized_nontrainable_weights:
@@ -1714,6 +1723,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
                 param.ds_tensor.final_location = final_location
                 param.ds_numel_aligned = tensor_size
+
+                # if not self.param_swapper.swappable_tensor(numel=partition_size):
+                #     logger.warning(f"param {param.ds_id} is not swappable tensor, tensor is located in {param.ds_tensor.device}, tensor size: {param.ds_tensor.nbytes}")
 
             start = partition_size * self.get_partition_rank()
             end = start + partition_size

@@ -96,8 +96,9 @@ class SwapBuffer(object):
 
 class SwapBufferPool(object):
 
-    def __init__(self, buffers):
-        assert all([get_accelerator().is_pinned(buf) for buf in buffers])
+    def __init__(self, buffers, use_geminifs=False):
+        if not use_geminifs:
+            assert all([get_accelerator().is_pinned(buf) for buf in buffers])
         self.buffers = [SwapBuffer(buf) for buf in buffers]
         self.current_index = 0
 

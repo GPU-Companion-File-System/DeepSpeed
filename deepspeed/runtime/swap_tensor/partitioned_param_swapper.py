@@ -125,6 +125,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.use_gds = self.aio_config[AIO_USE_GDS]
 
         # for debug
+        logger.error(f"Debug set: set use_geminifs to True")
         self.use_geminifs = True
 
         if self.use_geminifs:
@@ -496,16 +497,28 @@ class AsyncPartitionedParameterSwapper(object):
         return (numel % self.numel_alignment) == 0
 
     def reserve_partitioned_swap_space(self, partition_num_elems):
-        logger.error("!!!!!!!!!!!!!! This is not edited !!!!!!!!!!!!!!!!!!!!!!!")
+        # TODO: need to add multi-GPU support
+        logger.error("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
         aligned_numel = sum([self._io_aligned_numel(numel) for numel in partition_num_elems])
-        self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.zeros(aligned_numel,
-                                                                                device='cpu',
-                                                                                dtype=self.dtype),
-                                                                    align_bytes=0)
-        self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer])
+        # logger.error(f"Debug set: cuda device is set to true")
+        if self.use_geminifs:
+            self.partitioned_swap_buffer = torch.zeros(aligned_numel,
+                                                        device="cuda",
+                                                        dtype=self.dtype)
+            self.aio_read_handle.pin_device_tensor(self.partitioned_swap_buffer)
+
+        else:
+            self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.zeros(aligned_numel,
+                                                                                    device="cpu",
+                                                                                    dtype=self.dtype),
+                                                                        align_bytes=0)
+
+        self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer], use_geminifs=self.use_geminifs)
+        # logger.error(f"Debug set: use_geminifs is set to True")
+        # self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer], use_geminifs=True)
 
     def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):
-        logger.error("!!!!!!!!!!!!!! This is not edited !!!!!!!!!!!!!!!!!!!!!!!")
+        logger.error("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
         assert self.partitioned_swap_buffer is not None, 'partitioned swap buffers for fp16 params not initialized'
         assert self.partitioned_swap_pool is not None, 'partitioned swap pool for fp16 params not initialized'
         assert len(dst_fp16_params) == len(src_fp32_params), \
@@ -519,12 +532,29 @@ class AsyncPartitionedParameterSwapper(object):
         self.synchronize_writes()
         self.partitioned_swap_pool.reset()
         for i, fp32_tensor in enumerate(src_fp32_params):
+            logger.error(f"Debug: insert tensor {i} into partitioned swap pool, tensor is located in {fp32_tensor.device}")
             swap_tensor, _ = self.partitioned_swap_pool.insert_tensor(fp32_tensor, fp16_swap_paths[i],
                                                                       self._io_aligned_numel(fp32_tensor.numel()))
             assert swap_tensor is not None
             dst_fp16_params[i].ds_tensor.status = PartitionedParamStatus.AVAILABLE
 
-        self.partitioned_swap_pool.swap_out(self.aio_write_handle)
+        if self.use_geminifs:
+            async_op = False
+            # function to perform pool.swap_out
+            swap_tensors = []
+            swap_paths = []
+            for buffer in self.partitioned_swap_pool._get_used_buffers():
+                swap_tensors += buffer.get_swap_tensors()
+                swap_paths += buffer.get_swap_paths()
+            assert all([p is not None for p in swap_paths])
+
+            geminifs_swap_out_tensors(self, swap_tensors, swap_paths)
+
+            if not async_op:
+                self.synchronize_writes()
+
+        else:
+            self.partitioned_swap_pool.swap_out(self.aio_write_handle)
 
         for param in dst_fp16_params:
             param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
