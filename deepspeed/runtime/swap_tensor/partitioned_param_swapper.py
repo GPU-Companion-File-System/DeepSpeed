@@ -31,10 +31,13 @@ def geminifs_swap_in_tensors(swapper, tensor_buffers, swap_paths):
     # import traceback
     # print("Call trace for geminifs_swap_in_tensors:")
     # traceback.print_stack()
-    for buffer, path in zip(tensor_buffers, swap_paths):
+    stream = swapper.geminifs_streams.get("read", None)
+    if stream is None:
         stream = torch.cuda.Stream()
-        swapper.geminifs_streams.append(stream)
-        assert (swapper.aio_read_handle.read(buffer, path, False, 0, stream.cuda_stream) == 1)
+        swapper.geminifs_streams["read"] = stream
+    for buffer, path in zip(tensor_buffers, swap_paths):
+        assert swapper.aio_read_handle.read(buffer, path, False, 0, stream.cuda_stream), \
+                "GeminiFS: read failed for path {path}"
 
 
 def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
@@ -42,10 +45,13 @@ def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
     # import traceback
     # print("Call trace for geminifs_swap_in_tensors:")
     # traceback.print_stack()
-    for buffer, path in zip(tensor_buffers, swap_paths):
+    stream = swapper.geminifs_streams.get("write", None)
+    if stream is None:
         stream = torch.cuda.Stream()
-        swapper.geminifs_streams.append(stream)
-        assert (swapper.aio_write_handle.write(buffer, path, False, 0, stream.cuda_stream) == 1)
+        swapper.geminifs_streams["write"] = stream
+    for buffer, path in zip(tensor_buffers, swap_paths):
+        assert swapper.aio_write_handle.write(buffer, path, False, 0, stream.cuda_stream), \
+                "GeminiFS: write failed for path {path}"
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
@@ -124,7 +130,7 @@ class AsyncPartitionedParameterSwapper(object):
         if self.use_geminifs:
             logger.info("Using GeminiFS for class AsyncPartitionedParameterSwapper")
             self.aio_handle = GeminiFSBuilder().load(verbose=False).geminifs_handle
-            self.geminifs_streams = []
+            self.geminifs_streams = {"read": None, "write": None}
             self.geminifs_id_to_fd = {}
         elif self.use_gds:
             self.aio_handle = GDSBuilder().load(verbose=False).gds_handle
@@ -277,9 +283,7 @@ class AsyncPartitionedParameterSwapper(object):
         if self.pending_writes == 0:
             return
         if self.use_geminifs:
-            for stream in self.geminifs_streams:
-                stream.synchronize()
-            self.geminifs_streams.clear()
+            self.geminifs_streams["write"].synchronize()
         else:
             assert self.pending_writes == self.aio_write_handle.wait()
 
@@ -293,9 +297,7 @@ class AsyncPartitionedParameterSwapper(object):
             return
 
         if self.use_geminifs:
-            for stream in self.geminifs_streams:
-                stream.synchronize()
-            self.geminifs_streams.clear()
+            self.geminifs_streams["read"].synchronize()
         else:
             assert self.pending_reads == self.aio_read_handle.wait()
 
