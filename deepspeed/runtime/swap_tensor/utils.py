@@ -240,3 +240,127 @@ def get_sized_buffers(buffer_list, num_elems_list):
         for buffer, num_elems in zip(buffer_list, num_elems_list)
     ]
     return swap_buffers
+
+
+class SwapSliceBufferManager(object):
+
+    class SliceBuffer:
+        def __init__(self, buffer, offset, length, slice_id):
+            self.buffer = buffer
+            self.offset = offset
+            self.length = length
+            self.slice_id = slice_id
+
+        @property
+        def tensor(self):
+            return self.buffer[self.offset:self.offset + self.length]
+
+        def __repr__(self):
+            return f"SliceBuffer(id={self.slice_id}, offset={self.offset}, length={self.length})"
+
+
+    def __init__(self, buffer, aligned_size=64 * 1024, verbose=False):
+        self.buffer = buffer.flatten()
+        assert self.buffer.is_contiguous()
+        self.element_size = self.buffer.element_size()
+
+        self.free_list = [(0, self.buffer.numel())]
+        self.aligned_size = aligned_size
+        self.verbose = verbose         
+
+        self.slice_map = {}
+        self.next_id = 1
+        self.free_ids = []
+        self.min_free_bytes = self.buffer.numel()
+
+
+    def _aligned_len(self, length_elements):
+        size_bytes = length_elements * self.element_size
+        aligned_bytes = ((size_bytes + self.aligned_size - 1) //
+                         self.aligned_size) * self.aligned_size
+        return aligned_bytes // self.element_size
+
+    def _allocate(self, length, try_to_merge=True):
+
+        aligned_len = self._aligned_len(length)
+        for i, (offset, free_len) in enumerate(self.free_list):
+            if free_len >= aligned_len:
+                if self.free_ids:
+                    slice_id = self.free_ids.pop()
+                else:
+                    slice_id = self.next_id
+                    self.next_id += 1
+
+                slice_buffer = self.SliceBuffer(
+                    self.buffer, offset, aligned_len, slice_id
+                )
+
+                self.slice_map[slice_id] = slice_buffer
+
+                if free_len == aligned_len:
+                    self.free_list.pop(i)
+                else:
+                    self.free_list[i] = (offset + aligned_len,
+                                         free_len - aligned_len)
+                if self.verbose:
+                    total_free = self.get_total_free_bytes()
+                    if self.min_free_bytes > total_free:
+                        self.min_free_bytes = total_free
+                        logger.warning(f"Allocated {slice_buffer}, "
+                                       f"min free bytes so far: {self.min_free_bytes * self.element_size / 1024 ** 3} GB")
+
+                return slice_buffer
+
+        total_free = sum(l for _, l in self.free_list)
+        if total_free >= aligned_len and try_to_merge:
+            self.try_to_merge_free_list()
+            return self._allocate(length, try_to_merge=False)
+
+        return None
+    
+    def get_buffer_id(self, length):
+        slice_buffer = self._allocate(length)
+        if slice_buffer is None:
+            return None
+        return slice_buffer.slice_id
+
+    def _free(self, slice_buffer):
+        self.free_list.append((slice_buffer.offset, slice_buffer.length))
+        sid = slice_buffer.slice_id
+        self.slice_map.pop(sid, None)
+
+        self.free_ids.append(sid)
+        if len(self.free_list) > 16:
+            self.try_to_merge_free_list()
+
+    def get(self, slice_id):
+        slice_buffer = self.slice_map.get(slice_id, None)
+        if slice_buffer is not None:
+            return slice_buffer.tensor
+
+    def put(self, slice_id):
+        slice_buffer = self.slice_map.get(slice_id, None)
+        if slice_buffer is not None:
+            self._free(slice_buffer)
+
+    def try_to_merge_free_list(self):
+        if not self.free_list or len(self.free_list) == 1:
+            return
+
+        self.free_list.sort()
+        merged = []
+        cur_off, cur_len = self.free_list[0]
+
+        for off, length in self.free_list[1:]:
+            if cur_off + cur_len == off:
+                cur_len += length
+            else:
+                merged.append((cur_off, cur_len))
+                cur_off, cur_len = off, length
+
+        merged.append((cur_off, cur_len))
+        self.free_list = merged
+
+    def get_total_free_bytes(self):
+        total_free = sum(l for _, l in self.free_list)
+        return total_free 
