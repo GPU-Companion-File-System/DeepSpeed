@@ -493,6 +493,16 @@ class PartitionedParameterCoordinator:
             partitioned_params_without_secondary_tensors = [
                 p for p in partitioned_params if p.ds_secondary_tensor is None
             ]
+            logger.debug("partitioned_params_with_secondary_tensors:")
+            index = 0
+            for param_group in [partitioned_params_with_secondary_tensors]:
+                logger.debug(f"index = {index}, param_group len = {len(param_group)}")
+                index += 1
+            logger.debug("partitioned_params_without_secondary_tensors:")
+            index = 0
+            for param_group in [partitioned_params_without_secondary_tensors]:
+                logger.debug(f"index = {index}, param_group len = {len(param_group)}")
+                index += 1
             for param_group in [
                     partitioned_params_with_secondary_tensors, partitioned_params_without_secondary_tensors
             ]:
@@ -501,6 +511,7 @@ class PartitionedParameterCoordinator:
                 with get_accelerator().stream(self.__allgather_stream):
                     event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
                     self.__profiler.start_event(event_name)
+                    logger.debug(f"all_gather_coalesced is called for {len(param_group)} params")
                     handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:

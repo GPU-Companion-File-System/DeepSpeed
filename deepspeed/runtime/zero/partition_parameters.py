@@ -1580,7 +1580,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         for param in params:
             # logger.error(f"param {param.ds_id} status is {param.ds_tensor.status} final_location is {param.ds_tensor.final_location} ds_status is {param.ds_status}")
             if param.ds_tensor.status == PartitionedParamStatus.AVAILABLE:
-                logger.warning(f"param {param.ds_id} status is AVAILABLE tensor is located in {param.ds_tensor.device}, tensor size: {param.ds_tensor.nbytes}")
+                logger.debug(f"param {param.ds_id} status is AVAILABLE tensor is located in {param.ds_tensor.device}, tensor size: {param.ds_tensor.nbytes}")
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
                 swap_in_list.append(param)

@@ -25,31 +25,29 @@ def print_rank_0(message, debug=False, force=False):
         print(message)
 
 
+# added for geminifs_swap_in/out_tensors debug
+def print_geminifs(message, debug=False, force=False):
+    if debug or force:
+        print(message)
+
 def geminifs_swap_in_tensors(swapper, tensor_buffers, swap_paths):
-    print(f"GeminiFS: swap in tensors, buffer size: {tensor_buffers[0].size()}, path: {swap_paths[0]}, len of self.streams {len(swapper.geminifs_streams)}")
-    print(f"buffer is located in {tensor_buffers[0].device}")
-    # import traceback
-    # print("Call trace for geminifs_swap_in_tensors:")
-    # traceback.print_stack()
     stream = swapper.geminifs_streams.get("read", None)
     if stream is None:
         stream = torch.cuda.Stream()
         swapper.geminifs_streams["read"] = stream
-    for buffer, path in zip(tensor_buffers, swap_paths):
+    for i, (buffer, path) in enumerate(zip(tensor_buffers, swap_paths)):
+        print_geminifs(f"GeminiFS: swap in tensors[{i}], buffer size: {buffer.size()}, path: {path}")
         assert swapper.aio_read_handle.read(buffer, path, False, 0, stream.cuda_stream), \
                 "GeminiFS: read failed for path {path}"
 
 
 def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
-    print(f"GeminiFS: swap out tensors, buffer size: {tensor_buffers[0].size()}, path: {swap_paths[0]}")
-    # import traceback
-    # print("Call trace for geminifs_swap_in_tensors:")
-    # traceback.print_stack()
     stream = swapper.geminifs_streams.get("write", None)
     if stream is None:
         stream = torch.cuda.Stream()
         swapper.geminifs_streams["write"] = stream
-    for buffer, path in zip(tensor_buffers, swap_paths):
+    for i, (buffer, path) in enumerate(zip(tensor_buffers, swap_paths)):
+        print_geminifs(f"GeminiFS: swap out tensors[{i}], buffer size: {buffer.size()}, path: {path}")
         assert swapper.aio_write_handle.write(buffer, path, False, 0, stream.cuda_stream), \
                 "GeminiFS: write failed for path {path}"
 
@@ -127,6 +125,8 @@ class AsyncPartitionedParameterSwapper(object):
         # for debug
         logger.error(f"Debug set: set use_geminifs to True")
         self.use_geminifs = True
+        # self.use_geminifs = False
+
 
         if self.use_geminifs:
             logger.info("Using GeminiFS for class AsyncPartitionedParameterSwapper")
@@ -277,6 +277,7 @@ class AsyncPartitionedParameterSwapper(object):
             compute_buffers.append(compute_buffer)
             swap_buffers.append(swap_buffer)
 
+        logger.debug(f"!!!!!!!!!!!!!! Swapper buffer is consumed, current buffer size is {len(self.available_buffer_ids)} !!!!!!!!!!!!!!!!!!!!!!!")
         return compute_buffers, swap_buffers
 
     #waits for inflight nvme write to complete
@@ -340,6 +341,7 @@ class AsyncPartitionedParameterSwapper(object):
 
             param.ds_tensor.data = self.invalid_buffer.data
             param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+        logger.debug(f"!!!!!!!!!!!!!! Swapper buffer is back, current buffer size is {len(self.available_buffer_ids)} !!!!!!!!!!!!!!!!!!!!!!!")
 
     #writes from in memory to nvme. Does not release the buffers
     def _swap_out(self, params, async_op=True):
@@ -382,6 +384,7 @@ class AsyncPartitionedParameterSwapper(object):
 
     #assigns an in memory buffer and swaps in from nvme
     def swap_in(self, params, async_op=True, swap_in_buffers=None):
+        logger.debug(f"+++++++++++++++ len(params) = {len(params)}")
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
@@ -423,6 +426,7 @@ class AsyncPartitionedParameterSwapper(object):
 
     # Enables swapping into buffer that is out the control of swapper. This is always synchronous
     def swap_into_buffer(self, param, dest_buffer):
+        logger.debug(f"=======================")
         assert param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE, f"param {param.ds_id} is already available or inflight"
 
         require_swap_buffer = not (get_accelerator().is_pinned(dest_buffer)
@@ -471,9 +475,13 @@ class AsyncPartitionedParameterSwapper(object):
         self.param_id_to_swap_buffer[param_id] = swap_buffer
         compute_buffer = swap_buffer.narrow(0, 0, self.param_id_to_numel[param_id])
         print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}")
+        
+        logger.debug(f"!!!!!!!!!!!!!! Swapper buffer is consumed, current buffer size is {len(self.available_buffer_ids)} !!!!!!!!!!!!!!!!!!!!!!!")
+
         return compute_buffer
 
     def reserve_available_buffers(self):
+        logger.debug(f"!!!!!!!!!!!!!! Swapper buffer is reserved !!!!!!!!!!!!!!!!!!!!!!!")
         buffers = []
         for id in self.available_buffer_ids:
             buffers.append(
@@ -485,6 +493,7 @@ class AsyncPartitionedParameterSwapper(object):
         return buffers
 
     def release_reserved_buffers(self):
+        logger.debug(f"!!!!!!!!!!!!!! Swapper buffer is released !!!!!!!!!!!!!!!!!!!!!!!")
         for id in self.reserved_buffer_ids:
             self.available_buffer_ids.append(id)
         self.reserved_buffer_ids = []
@@ -498,9 +507,11 @@ class AsyncPartitionedParameterSwapper(object):
 
     def reserve_partitioned_swap_space(self, partition_num_elems):
         # TODO: need to add multi-GPU support
-        logger.error("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
+        # logger.debug("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
+        if self.use_geminifs:
+            logger.debug(f"Before reserve_partitioned_swap_space, current wrapper buffer size is {len(self.available_buffer_ids)}")
         aligned_numel = sum([self._io_aligned_numel(numel) for numel in partition_num_elems])
-        # logger.error(f"Debug set: cuda device is set to true")
+        # logger.debug(f"Debug set: cuda device is set to true")
         if self.use_geminifs:
             self.partitioned_swap_buffer = torch.zeros(aligned_numel,
                                                         device="cuda",
@@ -517,8 +528,12 @@ class AsyncPartitionedParameterSwapper(object):
         # logger.error(f"Debug set: use_geminifs is set to True")
         # self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer], use_geminifs=True)
 
+        if self.use_geminifs:
+            logger.debug(f"After reserve_partitioned_swap_space, current wrapper buffer size is {len(self.available_buffer_ids)}")
+
     def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):
-        logger.error("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
+        # logger.debug("!!!!!!!!!!!!!! Look at me, i'm callllllllled !!!!!!!!!!!!!!!!!!!!!!!")
+        logger.debug(f"Before swap_out_partitioned_params, current wrapper buffer size is {len(self.available_buffer_ids)}")
         assert self.partitioned_swap_buffer is not None, 'partitioned swap buffers for fp16 params not initialized'
         assert self.partitioned_swap_pool is not None, 'partitioned swap pool for fp16 params not initialized'
         assert len(dst_fp16_params) == len(src_fp32_params), \
@@ -532,7 +547,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.synchronize_writes()
         self.partitioned_swap_pool.reset()
         for i, fp32_tensor in enumerate(src_fp32_params):
-            logger.error(f"Debug: insert tensor {i} into partitioned swap pool, tensor is located in {fp32_tensor.device}")
+            logger.debug(f"Debug: insert tensor {i} into partitioned swap pool, tensor is located in {fp32_tensor.device}")
             swap_tensor, _ = self.partitioned_swap_pool.insert_tensor(fp32_tensor, fp16_swap_paths[i],
                                                                       self._io_aligned_numel(fp32_tensor.numel()))
             assert swap_tensor is not None
@@ -558,3 +573,5 @@ class AsyncPartitionedParameterSwapper(object):
 
         for param in dst_fp16_params:
             param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+
+        logger.debug(f"After swap_out_partitioned_params, current wrapper buffer size is {len(self.available_buffer_ids)}")
