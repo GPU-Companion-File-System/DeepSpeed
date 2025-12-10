@@ -11,9 +11,10 @@
 
 deepspeed_geminifs_handle_t::deepspeed_geminifs_handle_t(
     const std::string &config_path,
+    const uint64_t file_size,
     const int block_size, 
     const int nr_files)
-    : block_size_(block_size > GEMINIFS_MIN_PAGE ? block_size : GEMINIFS_MIN_PAGE), nr_files_(nr_files) {
+    : block_size_(block_size > GEMINIFS_MIN_PAGE ? block_size : GEMINIFS_MIN_PAGE), nr_files_(nr_files), file_size_(file_size){
     _init_geminifs_controller(config_path);
 }
 
@@ -32,7 +33,7 @@ void deepspeed_geminifs_handle_t::_init_geminifs_controller(const std::string &c
     if (!geminifs_initialized_) {
         std::lock_guard<std::mutex> lock(geminifs_mutex_);
         std::filesystem::path config_file_path(config_path);
-        auto file_size = {1ul, 1ul, static_cast<size_t>(get_block_size())};
+        auto file_size = {1ul, 1ul, static_cast<size_t>(file_size_)};
         // the config determines devices to use
         geminifs_instance_ = std::make_shared<GeminiFS>(config_file_path, nr_files_, file_size, true);
         geminifs_initialized_ = true;

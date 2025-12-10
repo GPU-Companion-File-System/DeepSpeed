@@ -11,9 +11,10 @@ using namespace pybind11::literals;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<deepspeed_geminifs_handle_t>(m, "geminifs_handle")
-        .def(py::init<const std::string&, const int, const int>(),
+        .def(py::init<const std::string&, const uint64_t, const int, const int>(),
             "Geminifs handle constructor",
             "config_path"_a,
+            "file_size"_a,
             "block_size"_a = 64 * 1024, // for geminifs
             "nr_files"_a = 1024)       // for geminifs
 

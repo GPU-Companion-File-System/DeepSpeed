@@ -8,6 +8,7 @@
 
 struct deepspeed_geminifs_handle_t {
     deepspeed_geminifs_handle_t(const std::string &config_path,
+                                const uint64_t file_size,
                                 const int block_size,
                                 const int nr_files);
     
@@ -51,6 +52,7 @@ struct deepspeed_geminifs_handle_t {
 private:
     const int block_size_;
     const int nr_files_;
+    const uint64_t file_size_;
 
     std::atomic<bool> geminifs_initialized_{false};
     std::shared_ptr<GeminiFS> geminifs_instance_;

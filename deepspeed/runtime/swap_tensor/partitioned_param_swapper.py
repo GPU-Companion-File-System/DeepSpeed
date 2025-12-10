@@ -158,6 +158,7 @@ class AsyncPartitionedParameterSwapper(object):
         if self.use_geminifs:
             logger.info(f"GeminiFS: config_path: , block_size: {self.aio_config[AIO_BLOCK_SIZE]}, nr_files: ")
             self.aio_read_handle = self.aio_handle(config_path="/home/yjq/LoRA-DeepSpeed/Geminifs/sys_config.ini",
+                                                   file_size = 256 * 1024 * 1024,
                                                     block_size=self.aio_config[AIO_BLOCK_SIZE],
                                                     nr_files=2048)
 

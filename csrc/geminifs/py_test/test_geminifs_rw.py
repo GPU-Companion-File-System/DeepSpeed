@@ -19,10 +19,10 @@ if __name__ == "__main__":
     # 1. 初始化 GeminiFS
     # -----------------------
     block_size = 64 * 1024
-    nr_files = 1024
-    config_path = "/home/zfw/LoRA-DeepSpeed/Geminifs/sys_config.ini"
+    nr_files = 64
+    config_path = "/home/yjq/LoRA-DeepSpeed/Geminifs/sys_config.ini"
 
-    handle = GeminiFSBuilder().load().geminifs_handle(config_path, block_size, nr_files)
+    handle = GeminiFSBuilder().load().geminifs_handle(config_path, 64*1024*1024, block_size, nr_files)
     print("Geminifs initialization test passed.")
 
     # -----------------------
@@ -31,7 +31,7 @@ if __name__ == "__main__":
     device_id = 0
     torch.cuda.set_device(device_id)
 
-    nr_xfer_files = 128
+    nr_xfer_files = 32
 
     # -----------------------
     # 3. 获取 GeminiFS GPU 文件句柄
@@ -48,7 +48,7 @@ if __name__ == "__main__":
     # 4. 构建要写入的数据
     # -----------------------
     write_tensors = [
-        torch.ones(block_size, dtype=torch.int8, device="cuda")
+        torch.ones(128*1024*1024, dtype=torch.int8, device="cuda")
         for _ in range(nr_xfer_files)
     ]
 
