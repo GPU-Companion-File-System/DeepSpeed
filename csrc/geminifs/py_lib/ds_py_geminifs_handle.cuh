@@ -16,6 +16,7 @@ struct deepspeed_geminifs_handle_t {
 
     int get_block_size();
     int get_alignment();
+    size_t get_file_size();
 
     bool read(torch::Tensor& buffer,
              const GPUFileId gpu_file_id,

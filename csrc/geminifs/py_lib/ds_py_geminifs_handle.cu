@@ -29,6 +29,10 @@ int deepspeed_geminifs_handle_t::get_alignment() {
     return GEMINIFS_MIN_PAGE;
 }
 
+size_t deepspeed_geminifs_handle_t::get_file_size() {
+    return file_size_;
+}
+
 void deepspeed_geminifs_handle_t::_init_geminifs_controller(const std::string &config_path) {
     if (!geminifs_initialized_) {
         std::lock_guard<std::mutex> lock(geminifs_mutex_);

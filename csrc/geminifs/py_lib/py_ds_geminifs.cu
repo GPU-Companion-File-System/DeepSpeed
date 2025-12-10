@@ -20,6 +20,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
         .def("get_block_size", &deepspeed_geminifs_handle_t::get_block_size)
         .def("get_alignment", &deepspeed_geminifs_handle_t::get_alignment)
+        .def("get_file_size", &deepspeed_geminifs_handle_t::get_file_size)
 
         .def("read",
             &deepspeed_geminifs_handle_t::read,

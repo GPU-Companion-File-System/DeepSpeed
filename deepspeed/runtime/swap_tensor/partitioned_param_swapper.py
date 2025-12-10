@@ -37,8 +37,21 @@ def geminifs_swap_in_tensors(swapper, tensor_buffers, swap_paths):
         swapper.geminifs_streams["read"] = stream
     for i, (buffer, path) in enumerate(zip(tensor_buffers, swap_paths)):
         print_geminifs(f"GeminiFS: swap in tensors[{i}], buffer size: {buffer.size()}, path: {path}")
-        assert swapper.aio_read_handle.read(buffer, path, False, 0, stream.cuda_stream), \
+        files_list = swapper.geminifs_first_id_to_fds[path]
+        assert len(files_list) > 0, f"GeminiFS: No files allocated for path {path}"
+        
+        if len(files_list) == 1:
+            assert swapper.aio_read_handle.read(buffer, files_list[0], False, 0, stream.cuda_stream), \
                 "GeminiFS: read failed for path {path}"
+        else:
+            offset = 0
+            for file_id in files_list:
+                cur_length = min(buffer.numel() - offset, swapper.aio_read_handle.get_file_size() // swapper.swap_element_size)
+                cur_buffer = buffer.narrow(0, offset, cur_length)
+                # logger.warning(f"GeminiFS: reading file_id {file_id} into buffer of size {cur_buffer.size()} at offset {offset}")
+                assert swapper.aio_read_handle.read(cur_buffer, file_id, False, 0, stream.cuda_stream), \
+                    "GeminiFS: read failed for path {path}"
+                offset += cur_buffer.numel()
 
 
 def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
@@ -46,10 +59,36 @@ def geminifs_swap_out_tensors(swapper, tensor_buffers, swap_paths):
     if stream is None:
         stream = torch.cuda.Stream()
         swapper.geminifs_streams["write"] = stream
+    print("GeminiFS: Starting swap out tensors, number of tensors:", len(tensor_buffers))
     for i, (buffer, path) in enumerate(zip(tensor_buffers, swap_paths)):
         print_geminifs(f"GeminiFS: swap out tensors[{i}], buffer size: {buffer.size()}, path: {path}")
-        assert swapper.aio_write_handle.write(buffer, path, False, 0, stream.cuda_stream), \
+        files_list = swapper.geminifs_first_id_to_fds[path]
+        assert len(files_list) > 0, f"GeminiFS: No files allocated for path {path}"
+        if len(files_list) == 1:
+            assert swapper.aio_write_handle.write(buffer, files_list[0], False, 0, stream.cuda_stream), \
                 "GeminiFS: write failed for path {path}"
+        else:
+            offset = 0
+            for file_id in files_list:
+                cur_length = min(buffer.numel() - offset, swapper.aio_write_handle.get_file_size() // swapper.swap_element_size)
+                cur_buffer = buffer.narrow(0, offset, cur_length)
+                # logger.warning(f"GeminiFS: writing file_id {file_id} into buffer of size {cur_buffer.size()} at offset {offset}")
+                assert swapper.aio_write_handle.write(cur_buffer, file_id, False, 0, stream.cuda_stream), \
+                    "GeminiFS: write failed for path {path}"
+                offset += cur_buffer.numel()
+
+def geminifs_allocate_swap_files(swapper, tensor_size, device_id):
+    gpu_file_ids = []
+    file_size = swapper.aio_read_handle.get_file_size()
+    nr_files = (tensor_size + file_size - 1) // file_size
+    for _ in range(nr_files):
+        ok, gpu_file_id = swapper.aio_read_handle.get_geminifs_gpu_file(device_id)
+        assert ok, "GeminiFS: Failed to get GeminiFS GPU file"
+        gpu_file_ids.append(gpu_file_id)
+    logger.info(f"GeminiFS: allocated {nr_files} files for tensor size {tensor_size} on device {device_id}")
+    for gpu_file_id in gpu_file_ids:
+        logger.info(f"GeminiFS: allocated gpu file id {gpu_file_id}")
+    return gpu_file_ids
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
@@ -134,6 +173,7 @@ class AsyncPartitionedParameterSwapper(object):
             self.aio_handle = GeminiFSBuilder().load(verbose=False).geminifs_handle
             self.geminifs_streams = {"read": None, "write": None}
             self.geminifs_id_to_fd = {}
+            self.geminifs_first_id_to_fds = {}
         elif self.use_gds:
             self.aio_handle = GDSBuilder().load(verbose=False).gds_handle
         else:
@@ -158,9 +198,9 @@ class AsyncPartitionedParameterSwapper(object):
         if self.use_geminifs:
             logger.info(f"GeminiFS: config_path: , block_size: {self.aio_config[AIO_BLOCK_SIZE]}, nr_files: ")
             self.aio_read_handle = self.aio_handle(config_path="/home/yjq/LoRA-DeepSpeed/Geminifs/sys_config.ini",
-                                                   file_size = 256 * 1024 * 1024,
+                                                   file_size = 64 * 1024 * 1024,
                                                     block_size=self.aio_config[AIO_BLOCK_SIZE],
-                                                    nr_files=2048)
+                                                    nr_files=1024)
 
             self.aio_write_handle = self.aio_read_handle
             logger.info(f"GeminiFS: aio_read_handle initialized")
@@ -222,7 +262,10 @@ class AsyncPartitionedParameterSwapper(object):
                 # assert cached_device_id == device_id, f"Cached device id {cached_device_id} does not match device id {device_id} for param {param_id}"
             else:
                 assert not must_exist, f"Path for param id {param_id} does not exist"
-                ok, gpu_file_id = self.aio_read_handle.get_geminifs_gpu_file(device_id)
+                # ok, gpu_file_id = self.aio_read_handle.get_geminifs_gpu_file(device_id)
+                gpu_file_ids = geminifs_allocate_swap_files(self, param.ds_tensor.ds_numel * self.swap_element_size, device_id)
+                gpu_file_id = gpu_file_ids[0]
+                self.geminifs_first_id_to_fds[gpu_file_id] = gpu_file_ids
                 self.geminifs_id_to_fd[param_id] = (device_id, gpu_file_id)
             paths.append(gpu_file_id)
         # logger.info(f"GeminiFS: swap id, path pair: ({param_id}, {gpu_file_id})")
