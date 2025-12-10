@@ -110,7 +110,7 @@ bool deepspeed_geminifs_handle_t::read(torch::Tensor& buffer,
         return false;
     }
     
-    return geminifs_instance_->geminifs_GPU_read_kernel(buffer, gpu_file_id, file_offset, gpu_controller, stream);
+    return geminifs_instance_->geminifs_xfer_kernel_one_tensor(buffer, gpu_file_id, file_offset, block_size_, gpu_controller, true, stream);
 }
 
 bool deepspeed_geminifs_handle_t::write(const torch::Tensor& buffer,
@@ -135,7 +135,7 @@ bool deepspeed_geminifs_handle_t::write(const torch::Tensor& buffer,
         return false;
     }
     
-    return geminifs_instance_->geminifs_GPU_write_kernel(buffer, gpu_file_id, file_offset, gpu_controller, stream);
+    return geminifs_instance_->geminifs_xfer_kernel_one_tensor(buffer, gpu_file_id, file_offset, block_size_, gpu_controller, false, stream);
 }
 
 std::tuple<bool, GPUFileId> deepspeed_geminifs_handle_t::get_geminifs_gpu_file(const int device_id) {
