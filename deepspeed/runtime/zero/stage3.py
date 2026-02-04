@@ -185,7 +185,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     ):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
-        print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
+        #print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
 
         if dist.get_rank() == 0:
             logger.info(f"Reduce bucket size {reduce_bucket_size}")
@@ -714,8 +714,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             start = start + src.ds_numel
             '''if the parameter was initialized in nvme then bring it to the destination buffer directly'''
             if src.status == PartitionedParamStatus.NOT_AVAILABLE:
-                print_rank_0(
-                    f"Swapping in {param.ds_id} with partition size {param.partition_numel()} permanently to CPU")
+                #print_rank_0(f"Swapping in {param.ds_id} with partition size {param.partition_numel()} permanently to CPU")
                 param.nvme_swapper.swap_into_buffer(param, dest)
                 src.data = dest.data
                 src.status = PartitionedParamStatus.AVAILABLE
@@ -856,6 +855,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # params to NVME after optimizer step
         for flattened_partition_group in self.fp16_partitioned_groups_flat:
             logger.error(f"flattened_partition_group is {flattened_partition_group}")
+        # Note: flattened_partition_group can be None for NVMe offload or bfloat16 dtype
+        # This is expected behavior and not an error
         should_create_fp16_flat_reuse_buffer = any(flattened_partition_group is None
                                                    for flattened_partition_group in self.fp16_partitioned_groups_flat)
         if should_create_fp16_flat_reuse_buffer:
@@ -880,13 +881,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                             self.fp16_partitioned_groups[sub_group_id]):
             dest = flat_buffer.narrow(0, offset, partitioned_param.ds_numel)
             if partitioned_param.status == PartitionedParamStatus.NOT_AVAILABLE:
-                print_rank_0(
-                    f"Swapping in {param.ds_id} with elements {param.ds_numel} and partition {param.partition_numel()}"
-                )
+                #print_rank_0(f"Swapping in {param.ds_id} with elements {param.ds_numel} and partition {param.partition_numel()}")
                 param.nvme_swapper.swap_in([param], async_op=False)
                 dest.data.copy_(partitioned_param.data)
                 param.nvme_swapper.remove_partition_and_release_buffers([param])
-                print_rank_0(f"Swapping in {param.ds_id} done")
+                #print_rank_0(f"Swapping in {param.ds_id} done")
             else:
                 dest.data.copy_(partitioned_param.data)
             offset += partitioned_param.ds_numel
@@ -1058,6 +1057,131 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+
+        # Ensure parameter has valid storage before optimizer step
+        # This is critical for ZeRO3 with parameter offload
+        # Check if parameter is empty or doesn't have valid storage
+        param_needs_recovery = False
+        try:
+            # Check if parameter is empty (numel == 0) or doesn't have accessible storage
+            if fp32_param.numel() == 0:
+                param_needs_recovery = True
+                logger.warning(f"Parameter for sub_group {sub_group_id} is empty (numel=0), attempting to recover")
+            else:
+                # Try to access data pointer to verify storage is accessible
+                _ = fp32_param.data_ptr()
+        except RuntimeError as e:
+            param_needs_recovery = True
+            logger.warning(f"Parameter for sub_group {sub_group_id} doesn't have accessible storage: {e}, attempting to recover")
+        
+        # Recover parameter from source if needed
+        if param_needs_recovery:
+            # If this is a swappable subgroup, try to swap in optimizer state
+            if self._swappable_optimizer_subgroup(sub_group_id) and hasattr(self, 'optimizer_swapper'):
+                try:
+                    # Use optimizer swapper to swap in the parameter
+                    self.optimizer_swapper.swap_in_optimizer_state(
+                        parameter=fp32_param,
+                        async_parameter=self.next_swappable_fp32_partitioned_groups[sub_group_id] if hasattr(self, 'next_swappable_fp32_partitioned_groups') else None
+                    )
+                    logger.info(f"Recovered parameter for sub_group {sub_group_id} from optimizer swap")
+                except Exception as e:
+                    logger.warning(f"Failed to recover parameter for sub_group {sub_group_id} from optimizer swap: {e}, trying fallback")
+                    # Fallback: try to create from fp16 source
+                    try:
+                        num_elements = self.fp16_partitioned_groups_flat_numel[sub_group_id]
+                        fp16_source = self.fp16_partitioned_groups_flat[sub_group_id]
+                        # Create fp32 copy from fp16 source
+                        recovered_param = fp16_source.to(self.device).clone().float().detach()
+                        if fp32_param.numel() == 0:
+                            fp32_param.data = recovered_param.data
+                        else:
+                            fp32_param.data.copy_(recovered_param.data)
+                        logger.info(f"Recovered parameter for sub_group {sub_group_id} from fp16 source (fallback)")
+                    except Exception as e2:
+                        logger.error(f"Failed to recover parameter for sub_group {sub_group_id} from fp16 source: {e2}")
+                        raise RuntimeError(f"Cannot recover parameter for sub_group {sub_group_id}: {e2}")
+            else:
+                # For non-swappable subgroups, try to recover from fp16 source
+                try:
+                    num_elements = self.fp16_partitioned_groups_flat_numel[sub_group_id]
+                    fp16_source = self.fp16_partitioned_groups_flat[sub_group_id]
+                    # Create fp32 copy from fp16 source
+                    recovered_param = fp16_source.to(self.device).clone().float().detach()
+                    if fp32_param.numel() == 0:
+                        fp32_param.data = recovered_param.data
+                    else:
+                        fp32_param.data.copy_(recovered_param.data)
+                    logger.info(f"Recovered parameter for sub_group {sub_group_id} from fp16 source")
+                except Exception as e:
+                    logger.error(f"Failed to recover parameter for sub_group {sub_group_id} from fp16 source: {e}")
+                    raise RuntimeError(f"Cannot recover parameter for sub_group {sub_group_id}: {e}")
+        
+        # Ensure parameter and gradient have valid storage and are contiguous
+        # This is critical - we must ensure both parameter and gradient are materialized before optimizer step
+        if fp32_param.grad is not None:
+            # Check and fix gradient storage
+            grad_needs_fix = False
+            try:
+                _ = fp32_param.grad.data_ptr()
+            except RuntimeError:
+                grad_needs_fix = True
+                logger.warning(f"Gradient for sub_group {sub_group_id} doesn't have accessible storage")
+            
+            if grad_needs_fix or not fp32_param.grad.is_contiguous():
+                # Force materialization by cloning
+                try:
+                    fp32_param.grad = fp32_param.grad.clone().contiguous()
+                    logger.info(f"Fixed gradient for sub_group {sub_group_id} by cloning")
+                except Exception as e:
+                    logger.error(f"Failed to fix gradient for sub_group {sub_group_id}: {e}")
+                    raise RuntimeError(f"Cannot fix gradient for sub_group {sub_group_id}: {e}")
+            
+            # Check and fix parameter storage
+            param_needs_fix = False
+            try:
+                _ = fp32_param.data_ptr()
+            except RuntimeError:
+                param_needs_fix = True
+                logger.warning(f"Parameter for sub_group {sub_group_id} doesn't have accessible storage")
+            
+            if param_needs_fix or not fp32_param.is_contiguous():
+                # Force materialization by cloning
+                try:
+                    fp32_param.data = fp32_param.clone().contiguous().data
+                    logger.info(f"Fixed parameter for sub_group {sub_group_id} by cloning")
+                except Exception as e:
+                    logger.error(f"Failed to fix parameter for sub_group {sub_group_id}: {e}")
+                    raise RuntimeError(f"Cannot fix parameter for sub_group {sub_group_id}: {e}")
+            
+            # Final verification: ensure both have valid storage and are fully materialized
+            # CRITICAL: We must ensure tensors are fully materialized before passing to optimizer
+            # The optimizer (CPU Adam) will call contiguous() internally, which may fail if tensors don't have storage
+            try:
+                # Force materialization by accessing data and ensuring contiguous
+                param_ptr = fp32_param.data_ptr()
+                grad_ptr = fp32_param.grad.data_ptr()
+                if param_ptr == 0 or grad_ptr == 0:
+                    raise RuntimeError(f"Parameter or gradient has null pointer for sub_group {sub_group_id}")
+                
+                # Ensure both are contiguous - this forces materialization
+                if not fp32_param.is_contiguous():
+                    fp32_param.data = fp32_param.contiguous().data
+                if not fp32_param.grad.is_contiguous():
+                    fp32_param.grad = fp32_param.grad.contiguous()
+                
+                # Final check: verify storage is accessible after making contiguous
+                param_ptr = fp32_param.data_ptr()
+                grad_ptr = fp32_param.grad.data_ptr()
+                if param_ptr == 0 or grad_ptr == 0:
+                    raise RuntimeError(f"Parameter or gradient has null pointer after materialization for sub_group {sub_group_id}")
+                    
+            except RuntimeError as e:
+                logger.error(f"Final storage check failed for sub_group {sub_group_id}: {e}")
+                logger.error(f"Parameter info: shape={fp32_param.shape}, dtype={fp32_param.dtype}, device={fp32_param.device}, numel={fp32_param.numel()}")
+                if fp32_param.grad is not None:
+                    logger.error(f"Gradient info: shape={fp32_param.grad.shape}, dtype={fp32_param.grad.dtype}, device={fp32_param.grad.device}, numel={fp32_param.grad.numel()}")
+                raise RuntimeError(f"Cannot proceed with optimizer step for sub_group {sub_group_id}: {e}")
 
         def step_with_gradscaler(optimizer):
             if self.torch_autocast_gradscaler:
@@ -1263,7 +1387,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             for param in param_group:
                 if param.requires_grad:
                     #print_rank_0(f" Before all gather {param.device}, {param.shape}")
-                    print_rank_0(f"Before all gather {param.device}, {param.shape}", force=False)
+                    #print_rank_0(f"Before all gather {param.device}, {param.shape}", force=False)
 
                     # The hook must be created in un-partitioned parameter
                     param.all_gather()
