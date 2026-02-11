@@ -4,10 +4,66 @@
 # DeepSpeed Team
 
 import torch
+import os
 from cpuinfo import get_cpu_info
 from deepspeed.utils import logger
 from deepspeed.utils.logging import should_log_le
 from deepspeed.ops.op_builder import CPUAdamBuilder
+
+
+def _safe_tensor_ptr(tensor: torch.Tensor) -> str:
+    try:
+        return str(tensor.data_ptr())
+    except Exception as e:
+        return f"<no-storage:{type(e).__name__}:{e}>"
+
+
+def _tensor_brief(tensor: torch.Tensor) -> str:
+    return (f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device}, "
+            f"numel={tensor.numel()}, contiguous={tensor.is_contiguous()}, ptr={_safe_tensor_ptr(tensor)}")
+
+
+def _rank_str() -> str:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return str(torch.distributed.get_rank())
+    return os.getenv("RANK", "NA")
+
+
+def _assert_tensor_has_storage(name: str, tensor: torch.Tensor) -> None:
+    try:
+        _ = tensor.data_ptr()
+    except RuntimeError as e:
+        logger.error(f"[rank={_rank_str()}] CPUAdam tensor without storage: {name}; {_tensor_brief(tensor)}; err={e}")
+        raise
+
+
+def _materialize_storage_for_adam(p_data: torch.Tensor, grad_data: torch.Tensor, exp_avg: torch.Tensor,
+                                  exp_avg_sq: torch.Tensor) -> None:
+    """Force eager storage materialization before crossing into C++ extension.
+
+    In ZeRO-3 optimizer offload + MoE workloads, tensors may occasionally hit a transient
+    storage-less state right before the C++ CPU Adam call. Touching data_ptr() here provides
+    a deterministic guard and surfaces which tensor is invalid when it happens.
+    """
+    _assert_tensor_has_storage("p", p_data)
+    _assert_tensor_has_storage("grad", grad_data)
+    _assert_tensor_has_storage("exp_avg", exp_avg)
+    _assert_tensor_has_storage("exp_avg_sq", exp_avg_sq)
+
+
+def _prepare_adam_tensors(p_data: torch.Tensor, grad_data: torch.Tensor, exp_avg: torch.Tensor,
+                          exp_avg_sq: torch.Tensor):
+    """Prepare stable contiguous tensors before entering C++ extension.
+
+    Returns:
+        Tuple[Tensor, Tensor, Tensor, Tensor]: (param, grad, exp_avg, exp_avg_sq)
+    """
+    p_c = p_data.contiguous()
+    g_c = grad_data.contiguous()
+    m_c = exp_avg.contiguous()
+    v_c = exp_avg_sq.contiguous()
+    _materialize_storage_for_adam(p_c, g_c, m_c, v_c)
+    return p_c, g_c, m_c, v_c
 
 
 class DeepSpeedCPUAdam(torch.optim.Optimizer):
@@ -159,10 +215,15 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
 
                 state['step'] += 1
                 beta1, beta2 = group['betas']
-
+                p_c, g_c, m_c, v_c = _prepare_adam_tensors(p.data, p.grad.data, state['exp_avg'], state['exp_avg_sq'])
                 self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
-                                             group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
-                                             state['exp_avg'], state['exp_avg_sq'])
+                                             group['weight_decay'], group['bias_correction'], p_c, g_c, m_c, v_c)
+                if p_c.data_ptr() != p.data.data_ptr():
+                    p.data.copy_(p_c)
+                if m_c.data_ptr() != state['exp_avg'].data_ptr():
+                    state['exp_avg'].copy_(m_c)
+                if v_c.data_ptr() != state['exp_avg_sq'].data_ptr():
+                    state['exp_avg_sq'].copy_(v_c)
         return loss
 
     @torch.no_grad()
@@ -197,9 +258,15 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
 
                 state['step'] += 1
                 beta1, beta2 = group['betas']
+                p_c, g_c, m_c, v_c = _prepare_adam_tensors(p.data, p.grad.data, state['exp_avg'], state['exp_avg_sq'])
                 self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
-                                             group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
-                                             state['exp_avg'], state['exp_avg_sq'])
+                                             group['weight_decay'], group['bias_correction'], p_c, g_c, m_c, v_c)
+                if p_c.data_ptr() != p.data.data_ptr():
+                    p.data.copy_(p_c)
+                if m_c.data_ptr() != state['exp_avg'].data_ptr():
+                    state['exp_avg'].copy_(m_c)
+                if v_c.data_ptr() != state['exp_avg_sq'].data_ptr():
+                    state['exp_avg_sq'].copy_(v_c)
         return loss
 
     @torch.no_grad()
